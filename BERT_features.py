@@ -19,94 +19,87 @@ class MyTokenizer():
         return self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(text))
 
 
-class Attn(nn.Module):
+class Attn(torch.nn.Module):
     def __init__(self, method, hidden_size):
         super(Attn, self).__init__()
-        
         self.method = method
+        if self.method not in ['dot', 'general', 'concat']:
+            raise ValueError(self.method, "is not an appropriate attention method.")
         self.hidden_size = hidden_size
-        
         if self.method == 'general':
-            self.attn = nn.Linear(self.hidden_size, hidden_size)
-
+            self.attn = torch.nn.Linear(self.hidden_size, hidden_size)
         elif self.method == 'concat':
-            self.attn = nn.Linear(self.hidden_size * 2, hidden_size)
-            self.other = nn.Parameter(torch.FloatTensor(1, hidden_size))
+            self.attn = torch.nn.Linear(self.hidden_size * 2, hidden_size)
+            self.v = torch.nn.Parameter(torch.FloatTensor(hidden_size))
+
+    def dot_score(self, hidden, encoder_output):
+        return torch.sum(hidden * encoder_output, dim=2)
+
+    def general_score(self, hidden, encoder_output):
+        energy = self.attn(encoder_output)
+        return torch.sum(hidden * energy, dim=2)
+
+    def concat_score(self, hidden, encoder_output):
+        energy = self.attn(torch.cat((hidden.expand(encoder_output.size(0), -1, -1), encoder_output), 2)).tanh()
+        return torch.sum(self.v * energy, dim=2)
 
     def forward(self, hidden, encoder_outputs):
-        seq_len = len(encoder_outputs)
-
-        # Create variable to store attention energies
-        attn_energies = torch.zeros(seq_len, device=device) # B x 1 x S
-
-        # Calculate energies for each encoder output
-        for i in range(seq_len):
-            attn_energies[i] = self.score(hidden, encoder_outputs[i])
-
-        # Normalize energies to weights in range 0 to 1, resize to 1 x 1 x seq_len
-        return F.softmax(attn_energies).unsqueeze(0).unsqueeze(0)
-    
-    def score(self, hidden, encoder_output):
-        
-        if self.method == 'dot':
-            energy = hidden.dot(encoder_output)
-            return energy
-        
-        elif self.method == 'general':
-            energy = self.attn(encoder_output)
-            energy = hidden.dot(energy)
-            return energy
-        
+        # Calculate the attention weights (energies) based on the given method
+        if self.method == 'general':
+            attn_energies = self.general_score(hidden, encoder_outputs)
         elif self.method == 'concat':
-            energy = self.attn(torch.cat((hidden, encoder_output), 1))
-            energy = self.other.dot(energy)
-            return energy
+            attn_energies = self.concat_score(hidden, encoder_outputs)
+        elif self.method == 'dot':
+            attn_energies = self.dot_score(hidden, encoder_outputs)
+
+        # Transpose max_length and batch_size dimensions
+        attn_energies = attn_energies.t()
+
+        # Return the softmax normalized probability scores (with added dimension)
+        return F.softmax(attn_energies, dim=1).unsqueeze(1)
 
 
-class AttnDecoderRNN(nn.Module):
-    def __init__(self, attn_model, hidden_size, output_size, n_layers=1, dropout_p=0.1):
-        super(AttnDecoderRNN, self).__init__()
-        
-        # Keep parameters for reference
+class LuongAttnDecoderRNN(nn.Module):
+    def __init__(self, attn_model, embedding, hidden_size, output_size, n_layers=1, dropout=0.1):
+        super(LuongAttnDecoderRNN, self).__init__()
+
+        # Keep for reference
         self.attn_model = attn_model
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.n_layers = n_layers
-        self.dropout_p = dropout_p
-        
-        # Define layers
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size * 2, hidden_size, n_layers, dropout=dropout_p)
-        self.out = nn.Linear(hidden_size * 2, output_size)
-        
-        # Choose attention model
-        if attn_model != 'none':
-            self.attn = Attn(attn_model, hidden_size)
-    
-    def forward(self, word_input, last_context, last_hidden, encoder_outputs):
-        # Note: we run this one step at a time
-        
-        # Get the embedding of the current input word (last output word)
-        word_embedded = self.embedding(word_input).view(1, 1, -1) # S=1 x B x N
-        
-        # Combine embedded input word and last context, run through RNN
-        rnn_input = torch.cat((word_embedded, last_context.unsqueeze(0)), 2)
-        rnn_output, hidden = self.gru(rnn_input, last_hidden)
+        self.dropout = dropout
 
-        # Calculate attention from current RNN state and all encoder outputs; apply to encoder outputs
-        attn_weights = self.attn(rnn_output.squeeze(0), encoder_outputs)
-        context = attn_weights.bmm(encoder_outputs.transpose(0, 1)) # B x 1 x N
-        
-        # Final output layer (next word prediction) using the RNN hidden state and context vector
-        rnn_output = rnn_output.squeeze(0) # S=1 x B x N -> B x N
-        context = context.squeeze(1)       # B x S=1 x N -> B x N
-        output = F.log_softmax(self.out(torch.cat((rnn_output, context), 1)))
-        
-        # Return final output, hidden state, and attention weights (for visualization)
-        return output, context, hidden, attn_weights
-    
-    def initHidden(self):
-        return torch.zeros(self.n_layers, 1, self.hidden_size, device=device)
+        # Define layers
+        self.embedding = embedding
+        self.embedding_dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=(0 if n_layers == 1 else dropout))
+        self.concat = nn.Linear(hidden_size * 2, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+
+        self.attn = Attn(attn_model, hidden_size)
+
+    def forward(self, input_step, last_hidden, encoder_outputs):
+        # Note: we run this one step (word) at a time
+        # Get embedding of current input word
+        embedded = self.embedding(input_step)
+        embedded = self.embedding_dropout(embedded)
+        # Forward through unidirectional GRU
+        rnn_output, hidden = self.gru(embedded, last_hidden)
+        # Calculate attention weights from the current GRU output
+        attn_weights = self.attn(rnn_output, encoder_outputs)
+        # Multiply attention weights to encoder outputs to get new "weighted sum" context vector
+        context = attn_weights.bmm(encoder_outputs.transpose(0, 1))
+        # Concatenate weighted context vector and GRU output using Luong eq. 5
+        rnn_output = rnn_output.squeeze(0)
+        context = context.squeeze(1)
+        concat_input = torch.cat((rnn_output, context), 1)
+        concat_output = torch.tanh(self.concat(concat_input))
+        # Predict next word using Luong eq. 6
+        output = self.out(concat_output)
+        output = F.softmax(output, dim=1)
+        # Return output and final hidden state
+        return output, hidden
 
 
 def train(input_tensor, target_tensor, bert_model, decoder, decoder_optimizer, criterion):
@@ -116,33 +109,29 @@ def train(input_tensor, target_tensor, bert_model, decoder, decoder_optimizer, c
     
     input_length = input_tensor.size(0)
     target_length = target_tensor.size(0)
+    batch_size = input_tensor.size(1)
     
     encoded_layers, pooled_output = bert_model(input_tensor)
     encoder_outputs = encoded_layers[-1] #use last layer
     
-    decoder_input = torch.tensor([[SOS_token]], device=device)
-    decoder_context = torch.zeros(1, decoder.hidden_size, device=device)
-    decoder_hidden = decoder.initHidden(input_tensor.size(1))
+    decoder_input = torch.tensor([[SOS_token for _ in range(batch_size)]], device=device)
+    decoder_hidden = None
     
     teacher_forcing_ratio = 0.5
     use_teacher_forcing = random.random() < teacher_forcing_ratio
     
     if use_teacher_forcing:
         for di in range(target_length):
-            decoder_output, decoder_context, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_context, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs)
             loss += criterion(decoder_output, target_tensor[di])
-            decoder_input = target_tensor[di]
+            decoder_input = target_tensor[di].view(1, -1)
     else:
         for di in range(target_length):
-            decoder_output, decoder_context, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_context, decoder_hidden, encoder_outputs)
+            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs)
             topv, topi = decoder_output.topk(1)
-            decoder_input = topi.squeeze().detach()  # detach from history as input
+            decoder_input = torch.tensor([[topi[i][0] for i in range(batch_size)]], device=device)
 
             loss += criterion(decoder_output, target_tensor[di])
-            if decoder_input.item() == EOS_token:
-                break
     
     loss.backward()
     decoder_optimizer.step()
@@ -151,33 +140,43 @@ def train(input_tensor, target_tensor, bert_model, decoder, decoder_optimizer, c
 
 def main():
     tokenizer = MyTokenizer()
+
     TEXT = data.Field(sequential=True, use_vocab=False, tokenize=tokenizer.numbericalized_tokenize,
              pad_token=0)
     SUMMARY = data.ReversibleField(sequential=True, init_token='<sos>', eos_token='<eos>')
-    train_data = data.TabularDataset(path='/home/yilin/summary/data/newsroom/small.json', format='json',
+
+    train_data = data.TabularDataset(path='/home/yilin/summary/data/newsroom/train.500.json', format='json',
                 fields={'text': ('text', TEXT), 'summary': ('summary', SUMMARY)})
     SUMMARY.build_vocab(train_data, max_size=30000)
 
     hidden_size = 768
-    output_size = len(SUMMARY.vocab)
+    vocab_size = len(SUMMARY.vocab)
     learning_rate = 0.0001
     n_epochs = 10
+    batch_size = 16
 
+    embedding = nn.Embedding(vocab_size, hidden_size)
     bert_model = BertModel.from_pretrained('bert-base-uncased')
     bert_model.eval()
-    attn_decoder = AttnDecoderRNN('general', hidden_size, output_size, n_layers=2).to(device)
+    attn_decoder = LuongAttnDecoderRNN('general', embedding, hidden_size, vocab_size, 1, 0.1).to(device)
 
     decoder_optimizer = optim.Adam(attn_decoder.parameters(), lr=learning_rate)
     criterion = nn.NLLLoss()
 
     for epoch in range(n_epochs):
-    running_loss = 0
-    for batch in tqdm.tqdm(data.BucketIterator(dataset=train_data, batch_size=4)):
-        loss = train(batch.text, batch.summary, bert_model, attn_decoder, decoder_optimizer, criterion)
-        running_loss += loss
-    
-    epoch_loss = running_loss / len(train_data)
-    print(f'Epoch: {epoch}, Training Loss: {epoch_loss}')
+        running_loss = 0
+        step = 0
+        for batch in tqdm.tqdm(data.BucketIterator(dataset=train_data, batch_size=batch_size)):
+            loss = train(batch.text, batch.summary, bert_model, attn_decoder, decoder_optimizer, criterion)
+            running_loss += loss
+            step += batch_size
+
+            if step % 1024 == 0:
+                print(f'Step: {step}, Training Loss: {running_loss/step}')
+                torch.save(attn_decoder.state_dict(), f'model/{step}.pt')
+        
+        epoch_loss = running_loss / len(train_data)
+        print(f'Epoch: {epoch}, Training Loss: {epoch_loss}')
 
 
 if __name__ == '__main__':
