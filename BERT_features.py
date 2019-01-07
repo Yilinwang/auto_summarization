@@ -9,6 +9,8 @@ from torch import optim
 import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+ print(torch.cuda.get_device_name(device))
 
 
 class MyTokenizer():
@@ -113,6 +115,7 @@ def train(input_tensor, target_tensor, bert_model, decoder, decoder_optimizer, c
     
     encoded_layers, pooled_output = bert_model(input_tensor)
     encoder_outputs = encoded_layers[-1] #use last layer
+    encoder_outputs = encoder_outputs.to(device)
     
     decoder_input = torch.tensor([[SOS_token for _ in range(batch_size)]], device=device)
     decoder_hidden = None
@@ -145,9 +148,13 @@ def main():
              pad_token=0)
     SUMMARY = data.ReversibleField(sequential=True, init_token='<sos>', eos_token='<eos>')
 
-    train_data = data.TabularDataset(path='/home/yilin/summary/data/newsroom/train.500.json', format='json',
+    print('Data Loading...')
+    train_data = data.TabularDataset(path='/home/yilin10945/summary/data/newsroom/train.200.json', format='json',
                 fields={'text': ('text', TEXT), 'summary': ('summary', SUMMARY)})
     SUMMARY.build_vocab(train_data, max_size=30000)
+    #import pickle
+    #pickle.dump((train_data, TEXT, SUMMARY), open('model/processed_data.pkl', 'wb'))
+    print('Data Loaded!!!')
 
     hidden_size = 768
     vocab_size = len(SUMMARY.vocab)
@@ -163,15 +170,16 @@ def main():
     decoder_optimizer = optim.Adam(attn_decoder.parameters(), lr=learning_rate)
     criterion = nn.NLLLoss()
 
+    print('Start Training...')
     for epoch in range(n_epochs):
         running_loss = 0
         step = 0
         for batch in tqdm.tqdm(data.BucketIterator(dataset=train_data, batch_size=batch_size)):
-            loss = train(batch.text, batch.summary, bert_model, attn_decoder, decoder_optimizer, criterion)
+            loss = train(batch.text, batch.summary.to(device), bert_model, attn_decoder, decoder_optimizer, criterion)
             running_loss += loss
             step += batch_size
 
-            if step % 1024 == 0:
+            if step % 128 == 0:
                 print(f'Step: {step}, Training Loss: {running_loss/step}')
                 torch.save(attn_decoder.state_dict(), f'model/{step}.pt')
         
